@@ -2,14 +2,13 @@ package cache
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
 
 	"github.com/go-spatial/cobra"
-	"github.com/go-spatial/geom"
 	"github.com/go-spatial/geom/slippy"
 	"github.com/go-spatial/proj"
 	"github.com/go-spatial/tegola/atlas"
@@ -20,6 +19,7 @@ import (
 	"github.com/go-spatial/tegola/internal/log"
 	"github.com/go-spatial/tegola/observability"
 	"github.com/go-spatial/tegola/provider"
+	"github.com/go-spatial/tegola/tms"
 )
 
 const defaultUsage = `Usage:{{if .Runnable}}
@@ -61,6 +61,9 @@ var (
 	// cacheTiers names the tiers of a layered cache that this run may write.
 	// Empty means the last tier in read order; "all" means every tier.
 	cacheTiers string
+	// cacheTileMatrixSet names the tiling scheme this run enumerates and
+	// writes. Empty means the default described by resolveSeedPurgeGrid.
+	cacheTileMatrixSet string
 )
 
 // CacheTiersAll is the --cache-tiers value that lifts the restriction entirely.
@@ -71,6 +74,9 @@ var (
 	seedPurgeWorker func(context.Context, MapTile) error
 	seedPurgeBounds [4]float64
 	seedPurgeMaps   []atlas.Map
+	// seedPurgeGrid is the TileMatrixSet this run enumerates tiles in and keys
+	// them by. One run means one grid — see resolveSeedPurgeGrid.
+	seedPurgeGrid *tms.TileMatrixSet
 	// seedWriteTiers is the resolved --cache-tiers value. nil means no
 	// restriction: write every tier.
 	seedWriteTiers []string
@@ -158,8 +164,10 @@ func init() {
 	SeedPurgeCmd.PersistentFlags().Int64VarP(&cacheLogThreshold, "log-threshold", "", 0, "during seeding, only log tiles that take this number of milliseconds or longer to render (default all tiles)")
 	SeedPurgeCmd.PersistentFlags().StringVarP(&cacheTiers, "cache-tiers", "", "", `for a layered cache (type = "multi"), the comma-separated tier names this run may write. defaults to the last tier in read order — the durable one; use "all" to write every tier, which is what you want to pre-warm. with --overwrite, the tiers NOT named here are purged after the write, so the hot tier stops serving pre-update tiles. no effect on a single-backend cache`)
 
+	SeedPurgeCmd.PersistentFlags().StringVarP(&cacheTileMatrixSet, "tile-matrix-set", "", "", "the tiling scheme to seed or purge, by tileMatrixSetId. one run covers one scheme. defaults to the map's own scheme when --map is given, otherwise WebMercatorQuad. every targeted map must support it")
+
 	SeedPurgeCmd.Flags().StringVarP(&cacheBounds, "bounds", "", "-180,-85.0511,180,85.0511", "lng/lat bounds to seed the cache with in the format: minx, miny, maxx, maxy")
-	SeedPurgeCmd.Flags().IntVarP(&cacheBoundsSRID, "bounds-srid", "", int(proj.EPSG4326), "the srid of the grid system for bounds.")
+	SeedPurgeCmd.Flags().IntVarP(&cacheBoundsSRID, "bounds-srid", "", int(proj.EPSG4326), "the srid --bounds are given in. only 4326 (lng/lat) is supported; use --tile-matrix-set to choose the tiling scheme")
 
 	SeedPurgeCmd.PersistentPreRunE = seedPurgeCmdValidatePersistent
 	SeedPurgeCmd.PreRunE = seedPurgeCmdValidate
@@ -169,6 +177,80 @@ func init() {
 
 	SeedPurgeCmd.AddCommand(TileListCmd)
 	SeedPurgeCmd.AddCommand(TileNameCmd)
+}
+
+// validateTileInGrid reports whether a named tile exists in the run's scheme.
+//
+// The active schemes differ in width — WorldCRS84Quad has 2*2^z columns where
+// WebMercatorQuad has 2^z — so a tile name valid in one can name nothing in the
+// other. Left unchecked, seeding it would generate and store a tile no request
+// can ask for, and the run would report success.
+func validateTileInGrid(tile slippy.Tile, grid *tms.TileMatrixSet) error {
+	if grid == nil {
+		// The parent command resolves the run's scheme before this runs, so a
+		// nil here means that ordering changed. Falling back to the default
+		// would defeat the check: in a WorldCRS84Quad run it would validate
+		// against WebMercatorQuad and pass exactly the tiles this exists to
+		// reject.
+		return fmt.Errorf("no tile matrix set has been resolved for this run")
+	}
+
+	cols, rows, err := grid.MatrixSize(int(tile.Z))
+	if err != nil {
+		return fmt.Errorf("tile matrix set %v has no tile matrix %v: %w", grid.ID(), tile.Z, err)
+	}
+
+	if int64(tile.X) >= cols || int64(tile.Y) >= rows {
+		return fmt.Errorf(
+			"tile %v/%v/%v is outside tile matrix set %v, whose matrix at zoom %v is %d columns by %d rows",
+			tile.Z, tile.X, tile.Y, grid.ID(), tile.Z, cols, rows,
+		)
+	}
+
+	return nil
+}
+
+// resolveSeedPurgeGrid picks the TileMatrixSet this run enumerates tiles in and
+// writes them under.
+//
+// --tile-matrix-set wins. Without it, a run scoped to one map takes that map's
+// default grid, and a run over every map takes WebMercatorQuad — what tegola
+// seeded before the grid was configurable.
+//
+// A targeted map that does not support the chosen grid is an error, not a skip.
+// A run enumerates one grid, so seeding such a map would walk indices that mean
+// nothing in its grid: the run would report success having written tiles no
+// request will ever ask for.
+func resolveSeedPurgeGrid() (*tms.TileMatrixSet, error) {
+	id := cacheTileMatrixSet
+	switch {
+	case id != "":
+	case cacheMap != "" && len(seedPurgeMaps) == 1:
+		id = seedPurgeMaps[0].TileGrid().ID()
+	default:
+		id = tms.WebMercatorQuad
+	}
+
+	grid, err := tms.Get(id)
+	if err != nil {
+		return nil, fmt.Errorf("tile matrix set %v: %w", id, err)
+	}
+
+	var unsupported []string
+	for _, m := range seedPurgeMaps {
+		if !m.SupportsTileGrid(grid.ID()) {
+			unsupported = append(unsupported, m.Name)
+		}
+	}
+
+	if len(unsupported) > 0 {
+		return nil, fmt.Errorf(
+			"maps %v do not support tile matrix set %v; re-run with --tile-matrix-set, or scope the run with --map",
+			unsupported, grid.ID(),
+		)
+	}
+
+	return grid, nil
 }
 
 // seedPurgeCmdValidate will validate the persistent flags and set associated variables as needed
@@ -197,6 +279,10 @@ func seedPurgeCmdValidatePersistent(cmd *cobra.Command, args []string) (err erro
 		if len(seedPurgeMaps) == 0 {
 			return fmt.Errorf("expected at least one map to be defined. check your config")
 		}
+	}
+
+	if seedPurgeGrid, err = resolveSeedPurgeGrid(); err != nil {
+		return err
 	}
 
 	// Find the seed command and find out what it was called as.
@@ -232,31 +318,30 @@ func seedPurgeCmdValidatePersistent(cmd *cobra.Command, args []string) (err erro
 
 }
 
-func IsKnownSrcConversionSRID(code proj.EPSGCode) bool {
-	return code == proj.EPSG3395 ||
-		code == proj.WebMercator ||
-		code == proj.WGS84 ||
-		code == proj.WorldEquidistantCylindrical
-}
-
-func AvailableSrcConversions() []proj.EPSGCode {
-	return []proj.EPSGCode{
-		proj.EPSG3395,
-		proj.WebMercator,
-		proj.WGS84,
-		proj.WorldEquidistantCylindrical,
+// validateBoundsSRID checks what --bounds-srid is allowed to say.
+//
+// The flag describes --bounds, which are validated as lng/lat and handed to the
+// tiling scheme as geographic coordinates; it does not, and no longer appears
+// to, select the scheme the run enumerates — that is --tile-matrix-set.
+//
+// So a projected srid describes nothing the flag can honour. It is rejected
+// rather than accepted and ignored: a run whose bounds were meant as metres
+// would otherwise seed a silently wrong area and report success.
+func validateBoundsSRID(srid int) error {
+	switch proj.EPSGCode(srid) {
+	case proj.WGS84:
+		return nil
+	default:
+		return fmt.Errorf(
+			"--bounds-srid=%d: bounds are lng/lat, so only %d is supported. to seed another tiling scheme use --tile-matrix-set",
+			srid, int(proj.WGS84),
+		)
 	}
 }
 
 func seedPurgeCmdValidate(cmd *cobra.Command, args []string) (err error) {
-	// validate the cache-bounds-srid
-	if !IsKnownSrcConversionSRID(proj.EPSGCode(cacheBoundsSRID)) {
-		var str strings.Builder
-		str.WriteString(fmt.Sprintf("SRID=%d is not a know conversion  ePSG code\n known codes are:", cacheBoundsSRID))
-		for _, code := range AvailableSrcConversions() {
-			str.WriteString(fmt.Sprintf(" %d\n", int(code)))
-		}
-		return errors.New(str.String())
+	if err := validateBoundsSRID(cacheBoundsSRID); err != nil {
+		return err
 	}
 
 	// validate and set bounds flag
@@ -306,38 +391,49 @@ func seedPurgeCommand(_ *cobra.Command, _ []string) (err error) {
 		}
 	}()
 
-	grid := slippy.NewGrid(proj.EPSGCode(cacheBoundsSRID), 0)
-
 	log.Info("zoom list: ", zooms)
-	tileChannel := generateTilesForBounds(ctx, seedPurgeBounds, zooms, grid)
+	log.Info("tile matrix set: ", seedPurgeGrid.ID())
+	tileChannel := generateTilesForBounds(ctx, seedPurgeBounds, zooms, seedPurgeGrid)
 
 	return doWork(ctx, tileChannel, seedPurgeMaps, cacheConcurrency, seedPurgeWorker)
 }
 
-func generateTilesForBounds(ctx context.Context, bounds [4]float64, zooms []uint, grid slippy.TileGridder) *TileChannel {
+// generateTilesForBounds streams every tile of grid, at each of zooms, covering
+// the given lng/lat bounds.
+//
+// The bounds are geographic whatever --bounds-srid says — they are validated as
+// lng/lat — and the grid decides the tile indices. Those were separate notions
+// before only by accident: the old code built a slippy grid from the bounds
+// SRID, which for the default 4326 produced WebMercator indices anyway.
+func generateTilesForBounds(ctx context.Context, bounds [4]float64, zooms []uint, grid *tms.TileMatrixSet) *TileChannel {
 
 	tce := &TileChannel{
 		channel: make(chan slippy.Tile),
 	}
 
 	if grid == nil {
-		grid = slippy.NewGrid(proj.EPSGCode(cacheBoundsSRID), 0)
+		grid = atlas.DefaultTileGrid()
 	}
 
 	go func() {
 		defer tce.Close()
 
-		var extent geom.Extent = bounds
+		// west/south/east/north, normalized so that a caller passing the corners
+		// in either order covers the same ground rather than reading as an
+		// antimeridian crossing.
+		west, east := math.Min(bounds[0], bounds[2]), math.Max(bounds[0], bounds[2])
+		south, north := math.Min(bounds[1], bounds[3]), math.Max(bounds[1], bounds[3])
+
 		for _, z := range zooms {
 
-			tiles, err := slippy.FromBounds(grid, &extent, slippy.Zoom(z))
+			tiles, err := grid.Tiles(west, south, east, north, []int{int(z)}, true)
 			if err != nil {
 				tce.setError(fmt.Errorf("got error trying to get tiles: %w", err))
 				tce.Close()
 				return
 			}
 			for _, tile := range tiles {
-				t := tile
+				t := slippy.Tile{Z: slippy.Zoom(tile.Z), X: uint(tile.X), Y: uint(tile.Y)}
 				select {
 				case tce.channel <- t:
 				case <-ctx.Done():

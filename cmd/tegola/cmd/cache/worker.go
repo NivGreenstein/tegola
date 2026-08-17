@@ -12,7 +12,23 @@ import (
 	"github.com/go-spatial/tegola/atlas"
 	"github.com/go-spatial/tegola/cache"
 	"github.com/go-spatial/tegola/internal/log"
+	"github.com/go-spatial/tegola/tms"
 )
+
+// bindRunGrid pins a map to the TileMatrixSet this seed or purge run operates
+// in.
+//
+// atlas.Map is a value, so this scopes the grid to one call: TileGrid then
+// reports the run's grid, and the existence check, the encode, and the cache key
+// all agree on it rather than each consulting the map's own default.
+// resolveSeedPurgeGrid has already established that the map supports it.
+func bindRunGrid(m atlas.Map) atlas.Map {
+	if seedPurgeGrid != nil {
+		m.TileMatrixSets = []*tms.TileMatrixSet{seedPurgeGrid}
+	}
+
+	return m
+}
 
 type seedPurgeWorkerTileError struct {
 	Purge bool
@@ -90,6 +106,8 @@ func seedWorker(overwrite bool, logThresholdMs int64) func(ctx context.Context, 
 			}
 		}
 
+		m = bindRunGrid(m)
+
 		z, x, y := mt.Tile.ZXY()
 
 		//	filter down the layers we need for this zoom
@@ -103,13 +121,10 @@ func seedWorker(overwrite bool, logThresholdMs int64) func(ctx context.Context, 
 				return fmt.Errorf("error fetching cache: %v", err)
 			}
 
-			//	cache key
-			key := cache.Key{
-				MapName: mt.MapName,
-				Z:       uint(z),
-				X:       x,
-				Y:       y,
-			}
+			//	cache key. it must name the same grid SeedMapTile will write
+			//	under, or the existence check reads a key nothing writes and
+			//	every tile looks absent.
+			key := cache.NewKey(m.TileGrid(), mt.MapName, "", uint(z), x, y)
 
 			//	read the tile from the cache
 			_, hit, err := c.Get(ctx, &key)
@@ -163,6 +178,8 @@ func purgeWorker(ctx context.Context, mt MapTile) error {
 			Err:   err,
 		}
 	}
+
+	m = bindRunGrid(m)
 
 	//	purge the tile
 	ttile := tegola.TileFromSlippyTile(mt.Tile)
